@@ -62,6 +62,7 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_physical_layers = int(os.environ.get("NUM_PHYSICAL_LAYERS", os.environ.get("NUM_LAYERS", 9)))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -69,6 +70,9 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    phase_buckets = int(os.environ.get("PHASE_BUCKETS", 4))
+    extra_proj_rmsnorm = bool(int(os.environ.get("EXTRA_PROJ_RMSNORM", "0")))
+    phase_conditioned_scales = bool(int(os.environ.get("PHASE_CONDITIONED_SCALES", "0")))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -289,7 +293,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,phase_attn_scale,phase_mlp_scale",
     ).split(",")
     if pattern
 )
@@ -560,6 +564,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        extra_proj_rmsnorm: bool,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -579,12 +584,14 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.proj_input_norm = RMSNorm() if extra_proj_rmsnorm else None
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        proj_in = self.proj_input_norm(x) if self.proj_input_norm is not None else x
+        q = self.c_q(proj_in).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(proj_in).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(proj_in).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -605,15 +612,17 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, extra_proj_rmsnorm: bool):
         super().__init__()
         hidden = mlp_mult * dim
+        self.fc_input_norm = RMSNorm() if extra_proj_rmsnorm else None
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        fc_in = self.fc_input_norm(x) if self.fc_input_norm is not None else x
+        x = torch.relu(self.fc(fc_in))
         return self.proj(x.square())
 
 
@@ -626,22 +635,40 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        phase_buckets: int,
+        extra_proj_rmsnorm: bool,
+        phase_conditioned_scales: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, extra_proj_rmsnorm)
+        self.mlp = MLP(dim, mlp_mult, extra_proj_rmsnorm)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.phase_buckets = max(1, phase_buckets)
+        self.phase_attn_scale = (
+            nn.Parameter(torch.ones(self.phase_buckets, dim, dtype=torch.float32))
+            if phase_conditioned_scales else None
+        )
+        self.phase_mlp_scale = (
+            nn.Parameter(torch.ones(self.phase_buckets, dim, dtype=torch.float32))
+            if phase_conditioned_scales else None
+        )
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, phase_bucket: int) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        attn_scale = self.attn_scale
+        mlp_scale = self.mlp_scale
+        if self.phase_attn_scale is not None:
+            attn_scale = attn_scale * self.phase_attn_scale[phase_bucket % self.phase_buckets]
+        if self.phase_mlp_scale is not None:
+            mlp_scale = mlp_scale * self.phase_mlp_scale[phase_bucket % self.phase_buckets]
+        x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -659,6 +686,10 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        num_physical_layers: int,
+        phase_buckets: int,
+        extra_proj_rmsnorm: bool,
+        phase_conditioned_scales: bool,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,6 +697,9 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.num_layers = num_layers
+        self.num_physical_layers = min(max(1, num_physical_layers), num_layers)
+        self.phase_buckets = max(1, phase_buckets)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -680,8 +714,11 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    self.phase_buckets,
+                    extra_proj_rmsnorm,
+                    phase_conditioned_scales,
                 )
-                for i in range(num_layers)
+                for i in range(self.num_physical_layers)
             ]
         )
         self.final_norm = RMSNorm()
@@ -705,12 +742,16 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            logical_layer = i
+            block = self.blocks[logical_layer % self.num_physical_layers]
+            x = block(x, x0, logical_layer % self.phase_buckets)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            logical_layer = self.num_encoder_layers + i
+            block = self.blocks[logical_layer % self.num_physical_layers]
+            x = block(x, x0, logical_layer % self.phase_buckets)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -835,6 +876,10 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        num_physical_layers=args.num_physical_layers,
+        phase_buckets=args.phase_buckets,
+        extra_proj_rmsnorm=args.extra_proj_rmsnorm,
+        phase_conditioned_scales=args.phase_conditioned_scales,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -906,6 +951,11 @@ def main() -> None:
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(
+        f"shared_depth:num_layers:{args.num_layers} num_physical_layers:{args.num_physical_layers} "
+        f"phase_buckets:{args.phase_buckets} extra_proj_rmsnorm:{args.extra_proj_rmsnorm} "
+        f"phase_conditioned_scales:{args.phase_conditioned_scales}"
     )
     log0(f"seed:{args.seed}")
 
